@@ -41,6 +41,12 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "wardrobe": wardrobe,        # user's wardrobe dict
         "outfit_suggestion": None,   # string returned by suggest_outfit
         "fit_card": None,            # string returned by create_fit_card
+        # richer state per planning.md
+        "outfit_suggestions": {},    # mapping listing_id -> outfit string
+        "fit_cards": {},             # mapping listing_id -> fit card string
+        "errors": [],                # list of error dicts for observability
+        "meta": {},                  # misc flags: wardrobe_empty, retries
+        "last_action": None,
         "error": None,               # set if the interaction ended early
     }
 
@@ -94,7 +100,179 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     """
     # TODO: implement the planning loop
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 2: Parse the user's query into description, size, max_price
+    import re
+
+    q = (query or "").strip()
+    size = None
+    max_price = None
+
+    # size: look for "size M" or "size: M"
+    m_size = re.search(r"\bsize\s*[:=]?\s*([A-Za-z0-9\-]+)\b", q, flags=re.I)
+    if m_size:
+        size = m_size.group(1).strip()
+
+    # price: prefer phrasing like "under $30", otherwise fall back to first $NN
+    m_under = re.search(r"under\s*\$?(\d+(?:\.\d+)?)", q, flags=re.I)
+    if m_under:
+        try:
+            max_price = float(m_under.group(1))
+        except Exception:
+            max_price = None
+    else:
+        m_dollar = re.search(r"\$\s*(\d+(?:\.\d+)?)", q)
+        if m_dollar:
+            try:
+                max_price = float(m_dollar.group(1))
+            except Exception:
+                max_price = None
+
+    # description: remove matched size/price tokens to leave a clean search phrase
+    desc = q
+    desc = re.sub(r"under\s*\$?\d+(?:\.\d+)?", "", desc, flags=re.I)
+    desc = re.sub(r"\$\s*\d+(?:\.\d+)?", "", desc)
+    desc = re.sub(r"\bsize\s*[:=]?\s*[A-Za-z0-9\-]+\b", "", desc, flags=re.I)
+    desc = desc.strip(" ,.-")
+    if not desc:
+        # fallback to entire query if nothing remains
+        desc = q
+
+    session["parsed"] = {"description": desc, "size": size, "max_price": max_price}
+
+    # Determine whether the user asked for styling-only
+    styling_only = bool(re.search(r"\b(styl|style)ing\s*(only)?\b|just styling|only styling|styling-only|style-only|just style\b", q, flags=re.I))
+
+    # Helper to record errors
+    def _record_error(stage: str, message: str, retryable: bool = False):
+        err = {"stage": stage, "message": message, "retryable": retryable, "attempts": 0}
+        session["errors"].append(err)
+
+    # If user requested styling-only, skip search and craft a pseudo-item from description
+    if styling_only:
+        session["last_action"] = "styling_only"
+        pseudo = {
+            "id": "pseudo-1",
+            "title": session["parsed"]["description"],
+            "description": session["parsed"]["description"],
+            "category": "",
+            "style_tags": [],
+            "colors": [],
+            "price": None,
+            "platform": "",
+        }
+        session["selected_item"] = pseudo
+        results = [pseudo]
+        session["search_results"] = results
+    else:
+        # Step 3: Call search_listings with parsed parameters
+        try:
+            results = search_listings(session["parsed"]["description"], size=session["parsed"]["size"], max_price=session["parsed"]["max_price"])
+            session["last_action"] = "search_listings"
+        except Exception as e:
+            _record_error("search_listings", str(e), retryable=True)
+            session["error"] = f"search_listings failed: {e}"
+            return session
+
+        session["search_results"] = results
+
+        # If no results, attempt one broadened retry per planning.md
+        if not results:
+            # prepare broadened params
+            broadened = session["parsed"].copy()
+            broadened_attempted = False
+            if session["parsed"].get("max_price") is not None:
+                try:
+                    broadened["max_price"] = float(session["parsed"]["max_price"]) * 1.5
+                    broadened_attempted = True
+                except Exception:
+                    broadened["max_price"] = None
+            elif session["parsed"].get("size"):
+                broadened["size"] = None
+                broadened_attempted = True
+
+            if broadened_attempted:
+                try:
+                    results = search_listings(broadened["description"], size=broadened.get("size"), max_price=broadened.get("max_price"))
+                    session["meta"]["broadened"] = True
+                    session["parsed"]["max_price"] = broadened.get("max_price")
+                    session["parsed"]["size"] = broadened.get("size")
+                    session["search_results"] = results
+                except Exception as e:
+                    _record_error("search_listings_broaden", str(e), retryable=True)
+
+            if not results:
+                session["error"] = (
+                    "I couldn't find any listings matching that query. "
+                    "Would you like me to broaden the price or remove the size filter?"
+                )
+                return session
+
+        # select top result automatically
+        session["selected_item"] = results[0]
+
+    # At this point we have at least one selected_item (either real or pseudo)
+    selected = session["selected_item"]
+
+    # Step 5: For the top N results (default 1-2), call suggest_outfit and store suggestions
+    N = min(2, len(session.get("search_results", []) or []))
+    for idx in range(N):
+        item = session["search_results"][idx]
+        item_id = item.get("id") or f"idx-{idx}"
+        try:
+            outfit_text = suggest_outfit(item, wardrobe)
+            session["outfit_suggestions"][item_id] = outfit_text
+            session["last_action"] = "suggest_outfit"
+            # flag wardrobe empty if applicable
+            if isinstance(wardrobe, dict) and not (wardrobe.get("items") or []):
+                session["meta"]["wardrobe_empty"] = True
+        except Exception as e:
+            _record_error("suggest_outfit", str(e), retryable=True)
+            # continue to next item rather than aborting whole flow
+            session["outfit_suggestions"][item_id] = ""
+
+        # Step 6: For each outfit, attempt to create a fit card (retry once on descriptive failure)
+        outfit_for_card = session["outfit_suggestions"].get(item_id, "")
+        if not outfit_for_card or not outfit_for_card.strip():
+            # no outfit to create card from — record and continue
+            _record_error("create_fit_card", "Missing outfit details", retryable=False)
+            session["fit_cards"][item_id] = ""
+            continue
+
+        try:
+            card = create_fit_card(outfit_for_card, item)
+        except Exception as e:
+            _record_error("create_fit_card", str(e), retryable=True)
+            session["fit_cards"][item_id] = ""
+            continue
+
+        # If card indicates missing outfit, retry once per planning.md
+        if isinstance(card, str) and card.startswith("Cannot create fit card"):
+            try:
+                card_retry = create_fit_card(outfit_for_card, item)
+                card = card_retry
+            except Exception:
+                card = None
+
+        if not card:
+            # fallback brief templated caption
+            title = (item.get("title") or item.get("name") or "This piece")
+            card = f"{title} — styled outfit: {outfit_for_card.splitlines()[0][:140]}"
+
+        session["fit_cards"][item_id] = card
+
+    # Populate top-level convenience fields for the single-item quick path
+    # If there is at least one item processed, surface the first suggestion/card
+    first_id = None
+    if session["search_results"]:
+        first = session["search_results"][0]
+        first_id = first.get("id") or "idx-0"
+    if first_id and session["outfit_suggestions"].get(first_id):
+        session["outfit_suggestion"] = session["outfit_suggestions"][first_id]
+    if first_id and session["fit_cards"].get(first_id):
+        session["fit_card"] = session["fit_cards"][first_id]
+
+    session["error"] = None
     return session
 
 
